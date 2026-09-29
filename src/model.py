@@ -246,6 +246,36 @@ class SiameseUNet(nn.Module):
         return self.head(x)
 
 
+class DiceBCELoss(nn.Module):
+    """Combined loss used to train change_detector.pth.
+
+    Matches Section III-C of the paper:
+        L = L_BCE + L_Dice
+        L_Dice = 1 - (2|P ∩ G| + eps) / (|P| + |G| + eps)
+
+    where P is the predicted change probability map (post-sigmoid)
+    and G is the ground-truth binary mask. BCE is computed on raw
+    logits (numerically stable), Dice on the sigmoid probabilities.
+    """
+
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce_loss = self.bce(logits, target)
+
+        probs = torch.sigmoid(logits)
+        # Sum over channel/height/width, keep batch dim, then average over batch.
+        intersection = (probs * target).sum(dim=(1, 2, 3))
+        union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+        dice_loss = 1.0 - ((2.0 * intersection + self.eps) / (union + self.eps))
+        dice_loss = dice_loss.mean()
+
+        return bce_loss + dice_loss
+
+
 def build_model(
     in_channels: int = 3,
     base_channels: int = 32,
