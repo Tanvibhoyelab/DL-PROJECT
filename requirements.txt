@@ -1,18 +1,27 @@
+# Streamlit dashboard
 streamlit>=1.36
-earthengine-api>=1.1.0
-geemap>=0.32
-geopy>=2.4
 folium>=0.16
 streamlit-folium>=0.20
+
+# Google Earth Engine / Sentinel-2
+earthengine-api>=1.1.0
+geopy>=2.4
+requests>=2.31
+python-dotenv>=1.0
+
+# Imaging and numerics
 numpy>=1.26
 pandas>=2.1
 Pillow>=10.2
 matplotlib>=3.8
-opencv-python>=4.9
-scikit-learn>=1.4
-scikit-image>=0.22
+opencv-python-headless>=4.9
+
+# Model
 torch>=2.2
 torchvision>=0.17
+
+# Reporting
 reportlab>=4.1
-requests>=2.31
-python-dotenv>=1.0
+
+# Only needed by download_data.py to fetch the LEVIR-CD training set
+datasets>=2.19

@@ -86,22 +86,25 @@ def build_pdf(context: dict) -> bytes:
     ])]
 
     m = context["model"]
-    story += [Paragraph("3. Model", h2), kv_table([
-        ["Architecture", m["architecture"]],
-        ["Trainable parameters", f"{m['parameters']:,}"],
-        ["Checkpoint", m["checkpoint"]],
-        ["Trained epochs", str(m["trained_epochs"])],
+    story += [Paragraph("3. Detector", h2), kv_table([
+        ["Method", m.get("architecture", "")],
+        ["Trainable parameters", f"{m.get('parameters', 0):,}"],
+        ["Checkpoint", str(m.get("checkpoint", "not applicable"))],
+        ["Trained epochs", str(m.get("trained_epochs", "not applicable"))],
         ["Decision threshold", str(context["threshold"])],
-        ["Compute device", m["device"]],
+        ["Compute device", str(m.get("device", "cpu"))],
     ])]
 
     s = context["statistics"]
     story += [Paragraph("4. Change statistics", h2), kv_table([
         ["Total pixels analysed", f"{s['total_pixels']:,}"],
         ["Changed pixels", f"{s['changed_pixels']:,}"],
+        ["Unchanged pixels", f"{s['unchanged_pixels']:,}"],
         ["Change percentage", f"{s['change_percentage']}%"],
         ["Detected regions", str(s["regions"])],
-        ["Estimated changed area", f"{s['changed_area_hectares']} hectares"],
+        ["Total area", f"{s['aoi_area_km2']} km²"],
+        ["Changed area", f"{s['changed_area_km2']} km² ({s['changed_area_hectares']} ha)"],
+        ["Unchanged area", f"{s['unchanged_area_km2']} km² ({s['unchanged_area_hectares']} ha)"],
         ["Largest changed region", f"{s['largest_region_hectares']} hectares"],
         ["Average confidence", f"{s['average_confidence'] * 100:.1f}%"],
     ])]
