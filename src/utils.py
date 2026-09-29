@@ -196,18 +196,24 @@ def compute_statistics(binary_mask: np.ndarray, prob_map: np.ndarray, regions, b
     pixel_area = px_x * px_y
     total = h * w
     changed = int(binary_mask.sum())
+    unchanged = total - changed
     largest = max((r.area_hectares for r in regions), default=0.0)
     avg_conf = float(np.mean([r.confidence for r in regions])) if regions else 0.0
     return {
         "total_pixels": total,
         "changed_pixels": changed,
+        "unchanged_pixels": unchanged,
         "change_percentage": round(100 * changed / max(total, 1), 3),
+        "unchanged_percentage": round(100 * unchanged / max(total, 1), 3),
         "regions": len(regions),
         "largest_region_hectares": round(largest, 4),
         "average_confidence": round(avg_conf, 4),
         "aoi_area_km2": round(total * pixel_area / 1_000_000, 4),
+        "changed_area_km2": round(changed * pixel_area / 1_000_000, 4),
+        "unchanged_area_km2": round(unchanged * pixel_area / 1_000_000, 4),
         "changed_area_m2": round(changed * pixel_area, 1),
         "changed_area_hectares": round(changed * pixel_area / 10_000, 4),
+        "unchanged_area_hectares": round(unchanged * pixel_area / 10_000, 4),
         "metres_per_pixel_x": round(px_x, 2),
         "metres_per_pixel_y": round(px_y, 2),
         "pixel_area_m2": round(pixel_area, 2),

@@ -1,12 +1,15 @@
-"""AI-Based Satellite Image Change Detection — Streamlit dashboard.
+"""Satellite change detection for any location in India.
 
-Run from the project root:
-    streamlit run app.py
+Workflow: Location -> Dates -> Cloud threshold -> Run detection ->
+Before/After -> Change overlay -> Metrics -> Downloads.
+
+Everything shown comes from real Sentinel-2 imagery fetched through Google
+Earth Engine and from a real PyTorch model. Nothing is simulated: when data or
+a trained checkpoint is missing, the app says so instead of showing a number.
 """
 
 from __future__ import annotations
 
-import calendar
 import datetime as dt
 import io
 import json
@@ -25,869 +28,570 @@ if str(ROOT) not in sys.path:
 import config  # noqa: E402
 from src import india_locations as loc  # noqa: E402
 from src import satellite as sat  # noqa: E402
-from src.inference import ModelNotAvailable, checkpoint_exists, load_model, run_change_detection  # noqa: E402
+from src.inference import (  # noqa: E402
+    METHOD_DIFFERENCE,
+    METHOD_MODEL,
+    ModelNotAvailable,
+    checkpoint_exists,
+    load_model,
+    run_change_detection,
+)
 from src.report import build_pdf  # noqa: E402
 from src.utils import RESOLUTION_NOTE, human_summary  # noqa: E402
 
-st.set_page_config(page_title="Satellite Change Detection — India", page_icon="🛰️", layout="wide")
+st.set_page_config(
+    page_title="India Satellite Change Detection",
+    page_icon="🛰️",
+    layout="wide",
+)
 
-PAGES = [
-    "1. Home",
-    "2. Location Selection",
-    "3. Satellite Data",
-    "4. Change Detection",
-    "5. Results",
-    "6. Visualization",
-    "7. Model Architecture",
-    "8. Dataset",
-    "9. Download",
-]
+INDIA_CENTER = (22.5937, 78.9629)
 
-DEFAULTS = {
-    "gee_ready": False,
-    "gee_error": "",
-    "gee_project": config.GEE_PROJECT_ID,
-    "location": None,
-    "aoi": None,
-    "before_scene": None,
-    "after_scene": None,
-    "before_date": dt.date(2024, 1, 1),
-    "after_date": dt.date(2025, 1, 1),
-    "result": None,
-    "fetch_error": "",
-    "detect_error": "",
-}
-for k, v in DEFAULTS.items():
-    st.session_state.setdefault(k, v)
+STATE = st.session_state
+STATE.setdefault("lat", None)
+STATE.setdefault("lon", None)
+STATE.setdefault("place", "")
+STATE.setdefault("result", None)
+STATE.setdefault("scenes", None)
+STATE.setdefault("gee_project", config.GEE_PROJECT_ID)
+STATE.setdefault("gee_error", "")
+STATE.setdefault("city_options", {})
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
 def png_bytes(array: np.ndarray) -> bytes:
     arr = array
     if arr.ndim == 2:
         arr = np.stack([arr] * 3, axis=-1)
-    buf = io.BytesIO()
-    Image.fromarray(arr.astype(np.uint8)).save(buf, format="PNG")
-    return buf.getvalue()
+    buffer = io.BytesIO()
+    Image.fromarray(arr.astype(np.uint8)).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
-def model_status() -> tuple[str, str]:
-    """Returns (badge, detail)."""
-    if not checkpoint_exists():
-        return ("🔴 TRAINED MODEL NOT AVAILABLE",
-                f"No checkpoint at {config.CHECKPOINT_PATH}. Train it first — see the Dataset page.")
+def set_point(lat: float, lon: float, label: str) -> None:
+    STATE.lat = float(lat)
+    STATE.lon = float(lon)
+    STATE.place = label
+    STATE.result = None
+    STATE.scenes = None
+
+
+def connect_gee(project: str) -> bool:
     try:
-        m = load_model()
-    except ModelNotAvailable as exc:
-        return "🔴 TRAINED MODEL NOT AVAILABLE", str(exc)
-    return ("🟢 REAL DEEP LEARNING MODEL",
-            f"Siamese U-Net · {m.parameters:,} parameters · {m.trained_epochs} epochs · {m.device}")
-
-
-def data_status() -> tuple[str, str]:
-    if st.session_state.gee_ready:
-        return "🟢 REAL SATELLITE DATA", "Google Earth Engine connected (Sentinel-2 Level-2A)."
-    return "🔴 SATELLITE DATA NOT CONNECTED", st.session_state.gee_error or "Earth Engine is not connected yet."
-
-
-def sidebar():
-    st.sidebar.title("🛰️ Change Detection")
-    page = st.sidebar.radio("Pages", PAGES, label_format=None) if False else st.sidebar.radio("Pages", PAGES)
-    st.sidebar.markdown("---")
-    d_badge, d_detail = data_status()
-    m_badge, m_detail = model_status()
-    st.sidebar.markdown(f"**{d_badge}**")
-    st.sidebar.caption(d_detail)
-    st.sidebar.markdown(f"**{m_badge}**")
-    st.sidebar.caption(m_detail)
-    st.sidebar.markdown("---")
-    if st.session_state.location:
-        l = st.session_state.location
-        st.sidebar.caption(f"📍 {l['display_name'][:70]}")
-        st.sidebar.caption(f"{l['lat']:.4f}, {l['lon']:.4f}")
-    if st.session_state.aoi:
-        st.sidebar.caption(f"AOI: {st.session_state.aoi.area_km2():.3f} km²")
-    return page
-
-
-def require(condition: bool, message: str) -> bool:
-    if not condition:
-        st.warning(message)
-    return condition
-
-
-def build_map(center, zoom=14, aoi=None, regions=None):
-    import folium
-
-    m = folium.Map(location=center, zoom_start=zoom, control_scale=True, tiles=None)
-    folium.TileLayer("OpenStreetMap", name="Street map").add_to(m)
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri", name="Satellite basemap", max_zoom=19,
-    ).add_to(m)
-    folium.Marker(center, tooltip="Selected location",
-                  icon=folium.Icon(color="blue", icon="map-pin", prefix="fa")).add_to(m)
-
-    fit_bounds = None
-    if aoi is not None:
-        aoi_bounds = aoi.folium_bounds()
-        folium.Rectangle(aoi_bounds, color="#0077ff", weight=2,
-                         fill=True, fill_opacity=0.08, tooltip="Analysis area (AOI)").add_to(m)
-        fit_bounds = list(aoi_bounds)
-
-    for r in regions or []:
-        min_lat, min_lon, max_lat, max_lon = r.bbox_latlon
-        color = "#e11d48" if r.confidence >= 0.75 else "#f59e0b"
-        popup = folium.Popup(
-            f"<b>Change #{r.change_id}</b><br>{r.change_type}<br>"
-            f"Confidence: {r.confidence * 100:.0f}%<br>"
-            f"Area: {r.area_hectares:.4f} ha<br>"
-            f"{r.centroid_lat:.5f}, {r.centroid_lon:.5f}",
-            max_width=260,
-        )
-        folium.Rectangle([[min_lat, min_lon], [max_lat, max_lon]], color=color,
-                         weight=2, fill=True, fill_opacity=0.25, popup=popup).add_to(m)
-        region_box = [[min_lat, min_lon], [max_lat, max_lon]]
-        fit_bounds = region_box if fit_bounds is None else [
-            [min(fit_bounds[0][0], region_box[0][0]), min(fit_bounds[0][1], region_box[0][1])],
-            [max(fit_bounds[1][0], region_box[1][0]), max(fit_bounds[1][1], region_box[1][1])],
-        ]
-
-    folium.LayerControl(collapsed=True).add_to(m)
-
-    # Auto-fit/zoom so the whole AOI (and any detected regions) is fully
-    # visible, instead of relying on a fixed zoom level that can crop a
-    # large or oddly-shaped AOI. A little padding keeps the AOI edge from
-    # touching the map border exactly.
-    if fit_bounds is not None:
-        m.fit_bounds(fit_bounds, padding=(30, 30))
-
-    return m
-
-
-def show_map(m, height=520):
-    from streamlit_folium import st_folium
-
-    return st_folium(m, height=height, width=None, returned_objects=["last_active_drawing"])
-
-
-def regions_dataframe() -> pd.DataFrame:
-    res = st.session_state.result
-    l = st.session_state.location
-    rows = []
-    for r in res["regions"]:
-        rows.append({
-            "location": l["display_name"],
-            "latitude": l["lat"],
-            "longitude": l["lon"],
-            "before_date": st.session_state.before_scene.acquisition_date,
-            "after_date": st.session_state.after_scene.acquisition_date,
-            "change_id": r.change_id,
-            "change_type": r.change_type,
-            "area_hectares": r.area_hectares,
-            "area_m2": r.area_m2,
-            "confidence": r.confidence,
-            "centroid_lat": r.centroid_lat,
-            "centroid_lon": r.centroid_lon,
-        })
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
-# Pages
-# ---------------------------------------------------------------------------
-def page_home():
-    st.title("AI-Based Satellite Image Change Detection")
-    st.subheader("Real-Time Geospatial Change Analysis using Sentinel-2 and Deep Learning")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        badge, detail = data_status()
-        st.markdown(f"### {badge}")
-        st.caption(detail)
-    with c2:
-        badge, detail = model_status()
-        st.markdown(f"### {badge}")
-        st.caption(detail)
-
-    st.markdown("---")
-    a, b, c = st.columns(3)
-    a.markdown("**Input**\n\nTwo real Sentinel-2 satellite images of the same place, taken on two different dates.")
-    b.markdown("**Processing**\n\nA Siamese CNN encoder reads both images with shared weights; a U-Net decoder turns the feature difference into a pixel-wise change probability.")
-    c.markdown("**Output**\n\nA change mask, a list of meaningful changed regions with area and confidence, statistics, a map and a PDF report.")
-
-    st.markdown("---")
-    st.markdown("### Connect Google Earth Engine")
-    st.caption("Real Sentinel-2 imagery is downloaded through Earth Engine. Nothing synthetic is ever generated.")
-    project = st.text_input("Earth Engine project id", value=st.session_state.gee_project,
-                            placeholder="my-ee-project", help="Set GEE_PROJECT_ID in .env to prefill this.")
-    if st.button("Connect to Earth Engine", type="primary"):
-        try:
-            used = sat.init_earth_engine(project.strip())
-            st.session_state.gee_ready = True
-            st.session_state.gee_project = used
-            st.session_state.gee_error = ""
-            st.success(f"Connected to Earth Engine (project: {used}).")
-        except sat.SatelliteError as exc:
-            st.session_state.gee_ready = False
-            st.session_state.gee_error = str(exc)
-            st.error(str(exc))
-
-    st.markdown("---")
-    st.info(RESOLUTION_NOTE)
-    st.markdown("**Workflow:** Location → AOI → dates → fetch real Sentinel-2 → detect changes → "
-                "results, map, downloads and PDF report.")
-
-
-def page_location():
-    st.title("Location Selection")
-    st.caption("Pick anywhere in India. The list is a shortcut — free-text search and manual coordinates cover the rest.")
-
-    mode = st.radio("How do you want to choose the location?",
-                    ["State → District → Area", "Search any place in India", "Enter latitude / longitude"],
-                    horizontal=True)
-
-    resolved = None
-    if mode == "State → District → Area":
-        c1, c2, c3 = st.columns(3)
-        state = c1.selectbox("State / UT", loc.STATES, index=loc.STATES.index("Maharashtra"))
-        districts = loc.districts_of(state)
-        district = c2.selectbox("District / City", districts)
-        areas = ["(whole district)"] + loc.areas_of(state, district)
-        area = c3.selectbox("Area / Locality", areas)
-        extra = st.text_input("Extra detail (optional)", placeholder="e.g. Bandra Kurla Complex")
-        if st.button("Locate", type="primary"):
-            with st.spinner("Geocoding…"):
-                try:
-                    resolved = loc.resolve_location(state, district, "" if area.startswith("(") else area, extra)
-                except loc.GeocodingError as exc:
-                    st.error(str(exc))
-
-    elif mode == "Search any place in India":
-        query = st.text_input("Search", placeholder="e.g. Hinjewadi Phase 2, Pune")
-        if st.button("Search", type="primary") and query.strip():
-            with st.spinner("Geocoding…"):
-                try:
-                    lat, lon, display = loc.geocode(query.strip() + ", India")
-                    resolved = {"lat": lat, "lon": lon, "display_name": display, "query": query}
-                except loc.GeocodingError as exc:
-                    st.error(str(exc))
-
-    else:
-        c1, c2 = st.columns(2)
-        lat = c1.number_input("Latitude", value=19.0596, format="%.6f", min_value=-90.0, max_value=90.0)
-        lon = c2.number_input("Longitude", value=72.8295, format="%.6f", min_value=-180.0, max_value=180.0)
-        label = st.text_input("Label (optional)", placeholder="Custom point")
-        if st.button("Use these coordinates", type="primary"):
-            resolved = {"lat": float(lat), "lon": float(lon),
-                        "display_name": label or f"Manual point ({lat:.4f}, {lon:.4f})", "query": "manual"}
-
-    if resolved:
-        st.session_state.location = resolved
-        st.session_state.aoi = None
-        st.session_state.before_scene = None
-        st.session_state.after_scene = None
-        st.session_state.result = None
-        st.success("Location set.")
-
-    if not st.session_state.location:
-        st.info("No location selected yet.")
-        return
-
-    l = st.session_state.location
-    st.markdown("### Selected location")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Latitude", f"{l['lat']:.4f}")
-    c2.metric("Longitude", f"{l['lon']:.4f}")
-    c3.metric("Zoom", "14 (local)")
-    st.write(f"**{l['display_name']}**")
-
-    st.markdown("### Area of Interest (AOI)")
-    aoi_mode = st.radio("AOI type", ["Radius around the point", "Draw a rectangle or polygon"], horizontal=True)
-
-    if aoi_mode == "Radius around the point":
-        radius = st.select_slider("Radius", options=[250, 500, 1000, 2000, 5000],
-                                  value=1000, format_func=lambda v: f"{v} m" if v < 1000 else f"{v / 1000:g} km")
-        try:
-            st.session_state.aoi = sat.make_radius_aoi(l["lat"], l["lon"], float(radius), l["display_name"])
-        except sat.SatelliteError as exc:
-            st.error(str(exc))
-    else:
-        st.caption("Use the draw tools on the map, then press the button below the map.")
-
-    aoi = st.session_state.aoi
-    m = build_map([l["lat"], l["lon"]], zoom=14, aoi=aoi)
-    if aoi_mode.startswith("Draw"):
-        from folium.plugins import Draw
-
-        Draw(export=False, draw_options={"polyline": False, "circle": False,
-                                         "circlemarker": False, "marker": False}).add_to(m)
-    state_map = show_map(m)
-
-    if aoi_mode.startswith("Draw"):
-        drawing = (state_map or {}).get("last_active_drawing")
-        if drawing and st.button("Use the drawn shape as AOI", type="primary"):
-            try:
-                coords = drawing["geometry"]["coordinates"][0]
-                st.session_state.aoi = sat.make_polygon_aoi([[c[0], c[1]] for c in coords], l["display_name"])
-                st.success("AOI set from the drawn shape.")
-                st.rerun()
-            except (KeyError, IndexError, TypeError, sat.SatelliteError) as exc:
-                st.error(f"Could not read the drawn shape: {exc}")
-
-    if st.session_state.aoi:
-        st.success(f"AOI area: **{st.session_state.aoi.area_km2():.3f} km²** "
-                   f"({st.session_state.aoi.kind})")
-
-
-_MONTH_NAMES = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-]
-
-
-def date_picker(label: str, key: str, default: dt.date,
-                 min_date: dt.date, max_date: dt.date) -> dt.date:
-    """Year / Month / Day dropdown picker.
-
-    Streamlit's built-in st.date_input renders a calendar popover whose
-    month/year dropdown can visually overlap the day grid, especially
-    inside a half-width column — that overlap is what was blocking date
-    selection on this page. Three plain selectboxes avoid that popover
-    entirely, so there is nothing that can overlap.
-    """
-
-    st.caption(label)
-
-    years = list(range(min_date.year, max_date.year + 1))
-    yc, mc, dc = st.columns(3)
-
-    year = yc.selectbox(
-        "Year", years,
-        index=years.index(min(max(default.year, min_date.year), max_date.year)),
-        key=f"{key}_year",
-    )
-
-    # Restrict month choices to what's valid for the chosen year given
-    # the overall min/max bounds.
-    month_start = 1 if year > min_date.year else min_date.month
-    month_end = 12 if year < max_date.year else max_date.month
-    months = list(range(month_start, month_end + 1))
-    default_month = min(max(default.month, month_start), month_end)
-
-    month = mc.selectbox(
-        "Month", months,
-        index=months.index(default_month),
-        format_func=lambda m: _MONTH_NAMES[m - 1],
-        key=f"{key}_month",
-    )
-
-    # Clip day range to the real number of days in the chosen month/year,
-    # and to the overall min/max bounds.
-    days_in_month = calendar.monthrange(year, month)[1]
-    day_start = min_date.day if (year == min_date.year and month == min_date.month) else 1
-    day_end = max_date.day if (year == max_date.year and month == max_date.month) else days_in_month
-    days = list(range(day_start, day_end + 1))
-    default_day = min(max(default.day, day_start), day_end)
-
-    day = dc.selectbox(
-        "Day", days,
-        index=days.index(default_day),
-        key=f"{key}_day",
-    )
-
-    return dt.date(year, month, day)
-
-
-def page_satellite():
-    st.title("Satellite Data")
-    if not require(st.session_state.location and st.session_state.aoi,
-                   "Select a location and an AOI on the Location Selection page first."):
-        return
-    if not require(st.session_state.gee_ready,
-                   "Earth Engine is not connected. Connect it on the Home page — no synthetic imagery is used."):
-        if st.session_state.gee_error:
-            st.error(st.session_state.gee_error)
-        return
-
-    c1, c2 = st.columns(2)
-    with c1:
-        before_date = date_picker("Before date", "before_date_picker",
-                                   st.session_state.before_date,
-                                   dt.date(2017, 3, 28), dt.date.today())
-    with c2:
-        after_date = date_picker("After date", "after_date_picker",
-                                  st.session_state.after_date,
-                                  dt.date(2017, 3, 28), dt.date.today())
-    c3, c4, c5 = st.columns(3)
-    max_cloud = c3.slider("Maximum cloud cover (%)", 0, 80, config.DEFAULT_MAX_CLOUD, 5)
-    window = c4.slider("Search window (± days)", 5, 120, config.DEFAULT_SEARCH_WINDOW_DAYS, 5)
-    size = c5.select_slider("Image size (px)", options=[256, 384, 512, 768], value=config.THUMB_SIZE)
-
-    st.session_state.before_date, st.session_state.after_date = before_date, after_date
-
-    try:
-        warnings = sat.validate_dates(before_date, after_date)
+        sat.init_earth_engine(project)
+        STATE.gee_error = ""
+        return True
     except sat.SatelliteError as exc:
-        st.error(str(exc))
-        return
-    for w in warnings:
-        st.warning(w)
-
-    if st.button("Fetch Satellite Images", type="primary"):
-        st.session_state.result = None
-        with st.spinner("Searching Sentinel-2 archive and downloading real imagery…"):
-            try:
-                before = sat.fetch_scene(st.session_state.aoi, before_date, window, max_cloud, size)
-                after = sat.fetch_scene(st.session_state.aoi, after_date, window, max_cloud, size)
-                st.session_state.before_scene, st.session_state.after_scene = before, after
-                st.session_state.fetch_error = ""
-            except sat.SatelliteError as exc:
-                st.session_state.before_scene = st.session_state.after_scene = None
-                st.session_state.fetch_error = str(exc)
-
-    if st.session_state.fetch_error:
-        st.error(st.session_state.fetch_error)
-        st.caption("No fake or synthetic image is shown in place of missing satellite data.")
-
-    b, a = st.session_state.before_scene, st.session_state.after_scene
-    if not (b and a):
-        return
-
-    st.success("Real Sentinel-2 imagery retrieved.")
-    c1, c2 = st.columns(2)
-    for col, scene, label in ((c1, b, "Before"), (c2, a, "After")):
-        with col:
-            st.markdown(f"#### {label} image")
-            st.image(scene.rgb, use_container_width=True)
-            st.markdown(
-                f"- **Satellite:** Sentinel-2 (Level-2A)\n"
-                f"- **Acquisition date:** {dt.date.fromisoformat(scene.acquisition_date):%d-%m-%Y}\n"
-                f"- **Cloud cover:** {scene.cloud_cover:.1f}%\n"
-                f"- **Resolution:** {scene.resolution_m} m\n"
-                f"- **Bands:** {scene.bands}\n"
-                f"- **Scene:** `{scene.scene_id[:44]}`\n"
-                f"- **Composite:** {'median of ' + str(scene.n_images) + ' scenes' if scene.composite else 'single scene'}"
-            )
-    st.info(RESOLUTION_NOTE)
+        STATE.gee_error = str(exc)
+        return False
 
 
-def page_detection():
-    st.title("Change Detection")
-    if not require(st.session_state.before_scene and st.session_state.after_scene,
-                   "Fetch the before/after satellite images first (Satellite Data page)."):
-        return
+def test_metrics() -> dict | None:
+    if config.TEST_METRICS_JSON.is_file():
+        try:
+            return json.loads(config.TEST_METRICS_JSON.read_text())
+        except json.JSONDecodeError:
+            return None
+    return None
 
-    badge, detail = model_status()
-    st.markdown(f"### {badge}")
-    st.caption(detail)
-    if badge.startswith("🔴"):
-        st.error("A trained checkpoint is required. Pixel differencing is **not** used as a stand-in "
-                 "for a deep-learning prediction.")
-        st.code("python -m src.train --data data/LEVIR-CD --epochs 40", language="bash")
-        return
 
-    c1, c2 = st.columns(2)
-    threshold = c1.slider(
-        "Change probability threshold",
-        min_value=0.01,
-        max_value=0.95,
-        value=float(config.DEFAULT_THRESHOLD),
-        step=0.01,
-        help="Threshold applied to the trained Siamese U-Net probability map.",
+# --------------------------------------------------------------------------
+# sidebar
+# --------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Setup")
+
+    project = st.text_input(
+        "Earth Engine project id",
+        value=STATE.gee_project,
+        help="A Google Cloud project registered for Earth Engine. Run "
+        "`earthengine authenticate` once on this machine first.",
     )
-    min_px = c2.slider(
-        "Minimum region size (pixels)",
+    STATE.gee_project = project
+    if st.button("Connect to Earth Engine", use_container_width=True):
+        with st.spinner("Contacting Earth Engine..."):
+            connect_gee(project)
+
+    if sat.is_ready():
+        st.success("Earth Engine connected")
+    elif STATE.gee_error:
+        st.error(STATE.gee_error)
+    else:
+        st.info("Not connected yet. Satellite imagery needs this connection.")
+
+    st.divider()
+    st.header("Detection settings")
+
+    method_label = st.radio(
+        "Detector",
+        ["Trained Siamese U-Net", "Pixel difference (no model)"],
+        help="The neural model is the real detector. The pixel-difference option is a "
+        "simple baseline, useful to sanity-check imagery — it is not a trained model.",
+    )
+    method = METHOD_MODEL if method_label.startswith("Trained") else METHOD_DIFFERENCE
+
+    model_ready = checkpoint_exists()
+    tuned_threshold = float(config.DEFAULT_THRESHOLD)
+    loaded = None
+    if method == METHOD_MODEL and model_ready:
+        try:
+            loaded = load_model()
+            tuned_threshold = float(loaded.threshold)
+        except ModelNotAvailable as exc:
+            st.error(str(exc))
+            model_ready = False
+
+    threshold = st.slider(
+        "Change probability threshold",
+        min_value=0.05,
+        max_value=0.95,
+        value=tuned_threshold,
+        step=0.01,
+        disabled=method == METHOD_DIFFERENCE,
+        help="Defaults to the threshold tuned on the validation split and stored in the "
+        "checkpoint.",
+    )
+    min_pixels = st.number_input(
+        "Ignore regions smaller than (pixels)",
         min_value=1,
-        max_value=400,
+        max_value=500,
         value=int(config.MIN_REGION_PIXELS),
         step=1,
     )
-
-    if st.button("Detect Changes", type="primary"):
-        with st.spinner("Running the Siamese U-Net…"):
-            try:
-                st.session_state.result = run_change_detection(
-                    st.session_state.before_scene.rgb,
-                    st.session_state.after_scene.rgb,
-                    st.session_state.aoi.bounds(),
-                    threshold=threshold,
-                    min_pixels=min_px,
-                )
-                st.session_state.detect_error = ""
-            except (ModelNotAvailable, Exception) as exc:  # noqa: BLE001
-                st.session_state.result = None
-                st.session_state.detect_error = f"{type(exc).__name__}: {exc}"
-
-    if st.session_state.detect_error:
-        st.error(st.session_state.detect_error)
-        return
-
-    res = st.session_state.result
-    if not res:
-        return
-
-    st.success(f"{len(res['regions'])} meaningful changed region(s) detected.")
-
-    # Diagnostics show the actual output of the trained model before/after cleanup.
-    d = res.get("diagnostics", {})
-    st.markdown("### Model prediction diagnostics")
-    dc = st.columns(5)
-    dc[0].metric("Min probability", f"{d.get('min_probability', 0.0) * 100:.2f}%")
-    dc[1].metric("Max probability", f"{d.get('max_probability', 0.0) * 100:.2f}%")
-    dc[2].metric("Average probability", f"{d.get('mean_probability', 0.0) * 100:.2f}%")
-    dc[3].metric("Raw changed pixels", f"{d.get('raw_changed_pixels', 0):,}")
-    dc[4].metric("Final changed pixels", f"{d.get('cleaned_changed_pixels', 0):,}")
-
-    max_probability = float(d.get("max_probability", 0.0))
-    if max_probability < threshold:
-        st.warning(
-            f"The model maximum probability is {max_probability * 100:.2f}%, "
-            f"below the current threshold of {threshold * 100:.2f}%. "
-            "Therefore the binary change mask is empty at this threshold."
-        )
-    elif d.get("raw_changed_pixels", 0) > 0 and d.get("cleaned_changed_pixels", 0) == 0:
-        st.warning(
-            "The model predicted changed pixels, but the minimum-region cleanup "
-            "removed all of them. Reduce the minimum region size."
-        )
-
-    cols = st.columns(5)
-    cols[0].image(st.session_state.before_scene.rgb, caption="Before", use_container_width=True)
-    cols[1].image(st.session_state.after_scene.rgb, caption="After", use_container_width=True)
-    cols[2].image(res["raw_mask_image"], caption="Raw model mask", use_container_width=True)
-    cols[3].image(res["mask_image"], caption="Final change mask", use_container_width=True)
-    cols[4].image(res["overlay"], caption="Change overlay", use_container_width=True)
-    st.image(res["difference"], caption="Raw difference image (reference only, not the model output)", width=380)
-
-    st.markdown("**Legend** — 🟥 red box: high-confidence change (≥75%) · 🟨 amber box: lower confidence · "
-                "orange fill: predicted changed pixels · everything else: unchanged area.")
-
-
-def page_results():
-    st.title("Results")
-    if not require(st.session_state.result, "Run the detection first (Change Detection page)."):
-        return
-
-    res = st.session_state.result
-    l, aoi = st.session_state.location, st.session_state.aoi
-    b, a = st.session_state.before_scene, st.session_state.after_scene
-    s = res["statistics"]
-
-    st.markdown("### A. Location summary")
-    c = st.columns(3)
-    c[0].write(f"**Location**\n\n{l['display_name']}")
-    c[1].write(f"**Coordinates**\n\n{l['lat']:.5f}, {l['lon']:.5f}")
-    aoi_desc = f"{aoi.radius_m:.0f} m radius" if aoi.kind == "radius" else f"drawn {aoi.kind}"
-    c[2].write(f"**AOI**\n\n{aoi_desc} · {aoi.area_km2():.3f} km²")
-
-    st.markdown("### B. Satellite information")
-    c = st.columns(4)
-    c[0].metric("Satellite", "Sentinel-2")
-    c[1].metric("Before acquisition", f"{dt.date.fromisoformat(b.acquisition_date):%d %b %Y}", f"{b.cloud_cover:.1f}% cloud")
-    c[2].metric("After acquisition", f"{dt.date.fromisoformat(a.acquisition_date):%d %b %Y}", f"{a.cloud_cover:.1f}% cloud")
-    c[3].metric("Ground sampling", f"{s['metres_per_pixel_x']:.1f} m/px")
-
-    st.markdown("### C. Change statistics")
-    c = st.columns(4)
-    c[0].metric("Changed area", f"{s['changed_area_hectares']:.3f} ha")
-    c[1].metric("Change percentage", f"{s['change_percentage']:.2f}%")
-    c[2].metric("Detected regions", s["regions"])
-    c[3].metric("Average confidence", f"{s['average_confidence'] * 100:.0f}%")
-
-    with st.expander("Advanced model diagnostics (for report / debugging)"):
-        d = res.get("diagnostics", {})
-        dc = st.columns(5)
-        dc[0].metric("Threshold", f"{res.get('threshold', 0.0) * 100:.1f}%")
-        dc[1].metric("Max probability", f"{d.get('max_probability', 0.0) * 100:.2f}%")
-        dc[2].metric("Average probability", f"{d.get('mean_probability', 0.0) * 100:.2f}%")
-        dc[3].metric("Raw changed pixels", f"{d.get('raw_changed_pixels', 0):,}")
-        dc[4].metric("Final changed pixels", f"{d.get('cleaned_changed_pixels', 0):,}")
-        st.caption(
-            "Detector used: pixel-difference fallback (model confidence was below threshold)"
-            if d.get("fallback_used") else "Detector used: trained Siamese U-Net model"
-        )
-
-    st.markdown("### D. Detected changes")
-    if res.get("diagnostics", {}).get("fallback_used") and res["regions"]:
-        st.warning(
-            "The trained model's confidence was too low to flag any region here, so these "
-            "results come from a classical pixel-difference fallback, not the neural network. "
-            "Treat them as candidate changes to verify visually, not confirmed model output."
-        )
-    if res["regions"]:
-        df = pd.DataFrame([{
-            "ID": r.change_id, "Type": r.change_type,
-            "Area (ha)": round(r.area_hectares, 4),
-            "Confidence": f"{r.confidence * 100:.0f}%",
-            "Latitude": r.centroid_lat, "Longitude": r.centroid_lon,
-        } for r in res["regions"]])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No region passed the size and probability thresholds.")
-
-    st.markdown("### E. Visual result")
-    cols = st.columns(4)
-    cols[0].image(b.rgb, caption="Before", use_container_width=True)
-    cols[1].image(a.rgb, caption="After", use_container_width=True)
-    cols[2].image(res["mask_image"], caption="Change mask", use_container_width=True)
-    cols[3].image(res["overlay"], caption="Overlay", use_container_width=True)
-
-    st.markdown("### F. Plain-language explanation")
-    summary = human_summary(
-        l["display_name"],
-        f"{dt.date.fromisoformat(b.acquisition_date):%d %B %Y}",
-        f"{dt.date.fromisoformat(a.acquisition_date):%d %B %Y}",
-        res["regions"], s,
+    max_cloud = st.slider("Maximum cloud cover in the AOI (%)", 0, 80, int(config.DEFAULT_MAX_CLOUD))
+    window_days = st.slider(
+        "Search window around each date (± days)",
+        7,
+        120,
+        int(config.DEFAULT_SEARCH_WINDOW_DAYS),
+        help="Sentinel-2 revisits every ~5 days, but a clear scene on the exact date is "
+        "not guaranteed. The app searches this window and reports the real date it used.",
     )
-    st.success(summary)
-
-    st.markdown("### G. Map of detected changes")
-    st.caption("Click a red or amber box to see the change id, type, confidence, area and coordinates.")
-    show_map(build_map([l["lat"], l["lon"]], 14, aoi, res["regions"]), height=520)
-
-    st.info(RESOLUTION_NOTE)
-
-
-def page_visualization():
-    st.title("Visualization")
-    if not require(st.session_state.result, "Run the detection first."):
-        return
-    res = st.session_state.result
-    before = st.session_state.before_scene.rgb
-    after = st.session_state.after_scene.rgb
-
-    st.markdown("### Side-by-side comparison")
-    c1, c2 = st.columns(2)
-    c1.image(before, caption=f"Before — {st.session_state.before_scene.acquisition_date}", use_container_width=True)
-    c2.image(after, caption=f"After — {st.session_state.after_scene.acquisition_date}", use_container_width=True)
-
-    st.markdown("### Blend slider (before ↔ after)")
-    alpha = st.slider("Move towards the after image", 0.0, 1.0, 0.5, 0.02)
-    blended = (before.astype(np.float32) * (1 - alpha) + after.astype(np.float32) * alpha).astype(np.uint8)
-    st.image(blended, use_container_width=True)
-
-    st.markdown("### Change overlay opacity")
-    op = st.slider("Overlay opacity", 0.0, 1.0, 0.45, 0.05)
-    mask = res["mask"].astype(bool)
-    over = after.copy().astype(np.float32)
-    over[mask] = over[mask] * (1 - op) + np.array([255, 90, 0], dtype=np.float32) * op
-    st.image(over.astype(np.uint8), use_container_width=True)
-
-    st.markdown("### Downloads")
-    c = st.columns(4)
-    c[0].download_button("Before image", png_bytes(before), "before.png", "image/png")
-    c[1].download_button("After image", png_bytes(after), "after.png", "image/png")
-    c[2].download_button("Change mask", png_bytes(res["mask_image"]), "change_mask.png", "image/png")
-    c[3].download_button("Overlay", png_bytes(res["overlay"]), "overlay.png", "image/png")
-
-    st.markdown("### Statistics from the predicted mask")
-    st.json(res["statistics"])
-
-
-def page_performance():
-    st.title("Model Performance")
-    st.caption("Every number here is read from files produced by training and evaluation. Nothing is invented.")
-
-    if not checkpoint_exists():
-        st.error("Model training has not been completed yet.")
-        st.code("python -m src.train --data data/LEVIR-CD --epochs 40\n"
-                "python -m src.evaluate --data data/LEVIR-CD", language="bash")
-        return
-
-    if config.TEST_METRICS_JSON.exists():
-        metrics = json.loads(config.TEST_METRICS_JSON.read_text())
-        st.markdown(f"### Test-set results ({metrics.get('pairs', '?')} image pairs)")
-        c = st.columns(6)
-        for col, key in zip(c, ["accuracy", "precision", "recall", "f1", "iou", "dice"]):
-            col.metric(key.upper() if key == "iou" else key.title(), f"{metrics[key]:.4f}")
-        st.caption(f"Threshold {metrics.get('threshold')} · checkpoint `{metrics.get('checkpoint')}`")
-    else:
-        st.warning("Test evaluation has not been run yet. Run: `python -m src.evaluate --data data/LEVIR-CD`")
-
-    if config.CONFUSION_MATRIX_PNG.exists():
-        st.markdown("### Confusion matrix")
-        st.image(str(config.CONFUSION_MATRIX_PNG), width=420)
-
-    if config.METRICS_CSV.exists():
-        st.markdown("### Training history")
-        df = pd.read_csv(config.METRICS_CSV)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        cols = st.columns(2)
-        for col, name, title in (
-            (cols[0], "training_loss.png", "Training loss"),
-            (cols[1], "validation_loss.png", "Validation loss"),
-            (cols[0], "iou_curve.png", "IoU curve"),
-            (cols[1], "f1_curve.png", "F1 curve"),
-        ):
-            path = config.OUTPUTS_DIR / name
-            if path.exists():
-                col.image(str(path), caption=title, use_container_width=True)
-    else:
-        st.warning("No training history file yet (outputs/metrics.csv).")
-
-
-def page_architecture():
-    st.title("Model Architecture")
-    st.code(
-        "Before image                After image\n"
-        "     |                            |\n"
-        "     v                            v\n"
-        "  Siamese Encoder  <shared weights>  Siamese Encoder\n"
-        "     |                            |\n"
-        "     +--------> Feature difference <--------+\n"
-        "                        |\n"
-        "                 U-Net Decoder (skip connections)\n"
-        "                        |\n"
-        "              Change probability map (0-1)\n"
-        "                        |\n"
-        "                   Thresholding\n"
-        "                        |\n"
-        "        Morphological cleaning + connected components\n"
-        "                        |\n"
-        "               Meaningful change regions",
-        language="text",
+    scene_mode = st.radio(
+        "Imagery",
+        ["Single clearest scene", "Cloud-masked median composite"],
+        help="A composite blends several dates but removes clouds; the single scene keeps "
+        "one exact acquisition date.",
     )
-    st.markdown(
-        "**Siamese encoder** — one small CNN reads both dates using the *same* weights, so the two "
-        "images are described in the same language.\n\n"
-        "**Feature difference** — the absolute difference of the two feature stacks. Things that stayed "
-        "the same cancel out; things that changed stand out.\n\n"
-        "**U-Net decoder** — upsamples the difference back to full resolution, reusing the fine detail "
-        "from earlier layers through skip connections.\n\n"
-        "**Threshold** — every pixel gets a probability between 0 and 1; above the threshold it counts as changed.\n\n"
-        "**Cleaning + regions** — morphological opening/closing removes speckle, then connected components "
-        "group the remaining pixels into regions with a bounding box, area, centroid and confidence."
+    mode = "best" if scene_mode.startswith("Single") else "composite"
+
+
+st.title("Satellite Change Detection — India")
+st.caption(
+    "Sentinel-2 Level-2A surface reflectance via Google Earth Engine + a Siamese U-Net "
+    "trained on LEVIR-CD."
+)
+
+# --------------------------------------------------------------------------
+# 1. Location
+# --------------------------------------------------------------------------
+st.subheader("1. Location")
+
+tab_admin, tab_search, tab_map, tab_coords = st.tabs(
+    ["State → District → City", "Search", "Pick on map", "Latitude / longitude"]
+)
+
+with tab_admin:
+    col1, col2, col3 = st.columns(3)
+    state_name = col1.selectbox("State / UT", loc.STATES, index=None, placeholder="Select a state")
+    districts = loc.districts_of(state_name) if state_name else []
+    district = col2.selectbox(
+        "District", districts, index=None, placeholder="Select a district", disabled=not districts
     )
-    if checkpoint_exists():
+
+    city_key = f"{state_name}|{district}"
+    cities = STATE.city_options.get(city_key, [])
+    with col3:
+        if state_name and district and not cities:
+            if st.button("Load cities & towns", use_container_width=True):
+                with st.spinner("Fetching places from OpenStreetMap..."):
+                    try:
+                        STATE.city_options[city_key] = loc.cities_of(state_name, district)
+                        cities = STATE.city_options[city_key]
+                    except loc.GeocodingError as exc:
+                        st.warning(str(exc))
+        city = st.selectbox(
+            "City / town (optional)",
+            [c["name"] for c in cities],
+            index=None,
+            placeholder="Whole district" if not cities else "Select a city",
+            disabled=not cities,
+        )
+
+    if st.button("Use this location", disabled=not (state_name and district)):
+        chosen = next((c for c in cities if c["name"] == city), None)
+        if chosen:
+            set_point(chosen["lat"], chosen["lon"], f"{city}, {district}, {state_name}")
+        else:
+            with st.spinner("Locating..."):
+                try:
+                    found = loc.resolve_location(state_name, district, city or "")
+                    set_point(found["lat"], found["lon"], found["display_name"])
+                except loc.GeocodingError as exc:
+                    st.error(str(exc))
+
+with tab_search:
+    query = st.text_input("Search any place in India", placeholder="e.g. Hinjawadi Phase 2, Pune")
+    if st.button("Search", disabled=not query):
         try:
-            m = load_model()
-            c = st.columns(4)
-            c[0].metric("Parameters", f"{m.parameters:,}")
-            c[1].metric("Input size", f"{m.input_size}px")
-            c[2].metric("Trained epochs", m.trained_epochs)
-            c[3].metric("Device", str(m.device))
-        except ModelNotAvailable as exc:
+            STATE.search_results = loc.search(query)
+        except loc.GeocodingError as exc:
+            STATE.search_results = []
             st.error(str(exc))
-    else:
-        st.warning("No checkpoint loaded, so no live parameter count is shown.")
-    st.markdown("**Loss:** BCE with positive-class weighting + Dice loss (change pixels are rare). "
-                "**Optimiser:** AdamW with ReduceLROnPlateau and early stopping.")
-
-
-def page_dataset():
-    st.title("Dataset")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### Training data — LEVIR-CD")
-        st.markdown(
-            "- Public building-change detection benchmark\n"
-            "- 637 very-high-resolution image pairs (0.5 m per pixel), usually cut into 256×256 patches\n"
-            "- Binary labels: changed building / no change\n"
-            "- Used **only** to train and evaluate the model\n"
-            "- These are **not** Indian satellite images — they come from Texas, USA"
+    results = STATE.get("search_results", [])
+    if results:
+        pick = st.radio(
+            "Matches",
+            list(range(len(results))),
+            format_func=lambda i: results[i]["display_name"],
         )
-        st.code("data/LEVIR-CD/\n  train/A  train/B  train/label\n  val/A    val/B    val/label\n"
-                "  test/A   test/B   test/label", language="text")
-    with c2:
-        st.markdown("### Real inference data — Sentinel-2")
-        st.markdown(
-            "- ESA Copernicus Sentinel-2, Level-2A surface reflectance\n"
-            "- Free and open, ~5-day revisit over India\n"
-            "- 10 m per pixel for B4/B3/B2 (true colour) and B8 (near infrared)\n"
-            "- Retrieved live through Google Earth Engine for the AOI and dates you choose"
-        )
-        st.warning("The two are deliberately kept separate: the model learns change on LEVIR-CD and is "
-                   "then applied to real Sentinel-2 imagery. Because Sentinel-2 is 20× coarser, results "
-                   "are reported as area-level change, not individual buildings.")
-    st.markdown("### Training commands")
-    st.code("python -m src.train --data data/LEVIR-CD --epochs 40 --batch-size 8\n"
-            "python -m src.evaluate --data data/LEVIR-CD", language="bash")
-    st.info(RESOLUTION_NOTE)
+        if st.button("Use selected match"):
+            chosen = results[pick]
+            set_point(chosen["lat"], chosen["lon"], chosen["display_name"])
 
-
-def page_download():
-    st.title("Download")
-    if not require(st.session_state.result, "Run the detection first."):
-        return
-    res = st.session_state.result
-    b, a = st.session_state.before_scene, st.session_state.after_scene
-    l, aoi = st.session_state.location, st.session_state.aoi
-
-    st.markdown("### Images")
-    c = st.columns(4)
-    c[0].download_button("Before image (PNG)", png_bytes(b.rgb), "before.png", "image/png")
-    c[1].download_button("After image (PNG)", png_bytes(a.rgb), "after.png", "image/png")
-    c[2].download_button("Change mask (PNG)", png_bytes(res["mask_image"]), "change_mask.png", "image/png")
-    c[3].download_button("Overlay (PNG)", png_bytes(res["overlay"]), "overlay.png", "image/png")
-
-    st.markdown("### Data")
-    df = regions_dataframe()
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    c1, c2 = st.columns(2)
-    c1.download_button("Detected changes (CSV)", df.to_csv(index=False).encode(),
-                       "detected_changes.csv", "text/csv")
-    c2.download_button("Statistics (JSON)", json.dumps(res["statistics"], indent=2).encode(),
-                       "statistics.json", "application/json")
-
-    st.markdown("### Analysis report")
-    if st.button("Generate Analysis Report (PDF)", type="primary"):
-        with st.spinner("Building the PDF…"):
-            summary = human_summary(
-                l["display_name"],
-                f"{dt.date.fromisoformat(b.acquisition_date):%d %B %Y}",
-                f"{dt.date.fromisoformat(a.acquisition_date):%d %B %Y}",
-                res["regions"], res["statistics"],
-            )
-            aoi_desc = f"{aoi.radius_m:.0f} m radius" if aoi.kind == "radius" else f"drawn {aoi.kind}"
-            pdf = build_pdf({
-                "location": l["display_name"],
-                "coordinates": f"{l['lat']:.5f}, {l['lon']:.5f}",
-                "aoi": aoi_desc,
-                "before_requested": st.session_state.before_date.strftime("%d %B %Y"),
-                "after_requested": st.session_state.after_date.strftime("%d %B %Y"),
-                "before_acquired": b.acquisition_date,
-                "after_acquired": a.acquisition_date,
-                "before_cloud": b.cloud_cover,
-                "after_cloud": a.cloud_cover,
-                "images": {"before": b.rgb, "after": a.rgb,
-                           "mask": res["mask_image"], "overlay": res["overlay"]},
-                "statistics": res["statistics"],
-                "regions": res["regions"],
-                "model": res["model"],
-                "threshold": res["threshold"],
-                "summary": summary,
-            })
-            name = f"change_report_{dt.datetime.now():%Y%m%d_%H%M%S}.pdf"
-            (config.REPORTS_DIR / name).write_bytes(pdf)
-            st.download_button("Download the PDF report", pdf, name, "application/pdf")
-            st.success(f"Report also saved to reports/{name}")
-
-
-# ---------------------------------------------------------------------------
-PAGE_FUNCS = {
-    PAGES[0]: page_home,
-    PAGES[1]: page_location,
-    PAGES[2]: page_satellite,
-    PAGES[3]: page_detection,
-    PAGES[4]: page_results,
-    PAGES[5]: page_visualization,
-    PAGES[6]: page_architecture,
-    PAGES[7]: page_dataset,
-    PAGES[8]: page_download,
-}
-
-
-def main():
-    page = sidebar()
+with tab_map:
+    st.caption("Click anywhere on the map to drop the area of interest.")
     try:
-        PAGE_FUNCS[page]()
-    except Exception as exc:  # never crash the whole dashboard
-        st.error(f"Something went wrong on this page: {type(exc).__name__}: {exc}")
-        st.caption("Fix the reported problem and try again — the rest of the dashboard is still usable.")
+        import folium
+        from streamlit_folium import st_folium
 
+        center = (
+            (STATE.lat, STATE.lon)
+            if STATE.lat is not None
+            else INDIA_CENTER
+        )
+        fmap = folium.Map(location=center, zoom_start=5 if STATE.lat is None else 12, tiles=None)
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri",
+            name="Satellite",
+        ).add_to(fmap)
+        folium.TileLayer("OpenStreetMap", name="Map").add_to(fmap)
+        folium.LayerControl().add_to(fmap)
+        if STATE.lat is not None:
+            folium.Marker([STATE.lat, STATE.lon], tooltip=STATE.place).add_to(fmap)
+        clicked = st_folium(fmap, height=420, width=None, key="picker")
+        if clicked and clicked.get("last_clicked"):
+            lat = clicked["last_clicked"]["lat"]
+            lon = clicked["last_clicked"]["lng"]
+            if (STATE.lat, STATE.lon) != (lat, lon):
+                set_point(lat, lon, loc.reverse(lat, lon))
+                st.rerun()
+    except ImportError:
+        st.warning("Install folium and streamlit-folium to use the map picker.")
 
-if __name__ == "__main__":
-    main()
+with tab_coords:
+    col1, col2 = st.columns(2)
+    manual_lat = col1.number_input("Latitude", value=float(STATE.lat or 20.5937), format="%.6f")
+    manual_lon = col2.number_input("Longitude", value=float(STATE.lon or 78.9629), format="%.6f")
+    if st.button("Use these coordinates"):
+        set_point(manual_lat, manual_lon, f"{manual_lat:.5f}, {manual_lon:.5f}")
+
+radius_km = st.slider(
+    "Area of interest radius (km)",
+    min_value=float(config.MIN_AOI_RADIUS_KM),
+    max_value=float(config.MAX_AOI_RADIUS_KM),
+    value=float(config.DEFAULT_AOI_RADIUS_KM),
+    step=0.5,
+)
+
+if STATE.lat is None:
+    st.info("Pick a location to continue.")
+    st.stop()
+
+aoi = sat.make_radius_aoi(STATE.lat, STATE.lon, radius_km * 1000, STATE.place)
+col_a, col_b, col_c = st.columns(3)
+col_a.metric("Latitude", f"{STATE.lat:.5f}")
+col_b.metric("Longitude", f"{STATE.lon:.5f}")
+col_c.metric("AOI area", f"{aoi.area_km2():.2f} km²")
+st.write(f"**Selected:** {STATE.place}")
+
+# --------------------------------------------------------------------------
+# 2. Dates
+# --------------------------------------------------------------------------
+st.subheader("2. Dates")
+today = dt.date.today()
+col1, col2 = st.columns(2)
+before_date = col1.date_input(
+    "Before date",
+    value=today - dt.timedelta(days=730),
+    min_value=dt.date.fromisoformat(config.S2_START_DATE),
+    max_value=today,
+)
+after_date = col2.date_input(
+    "After date",
+    value=today - dt.timedelta(days=30),
+    min_value=dt.date.fromisoformat(config.S2_START_DATE),
+    max_value=today,
+)
+
+try:
+    for warning in sat.validate_dates(before_date, after_date):
+        st.warning(warning)
+    dates_ok = True
+except sat.SatelliteError as exc:
+    st.error(str(exc))
+    dates_ok = False
+
+# --------------------------------------------------------------------------
+# 3. Run
+# --------------------------------------------------------------------------
+st.subheader("3. Run detection")
+run_disabled = not (dates_ok and sat.is_ready()) or (method == METHOD_MODEL and not model_ready)
+if method == METHOD_MODEL and not model_ready:
+    st.error(
+        "No trained checkpoint found at "
+        f"`{config.CHECKPOINT_PATH}`. Train one with:\n\n"
+        "```\npython download_data.py\npython -m src.train --data data/LEVIR-CD\n```\n"
+        "Or switch the detector to 'Pixel difference' in the sidebar to inspect imagery only."
+    )
+if not sat.is_ready():
+    st.warning("Connect to Earth Engine in the sidebar before running detection.")
+
+if st.button("Run change detection", type="primary", disabled=run_disabled):
+    try:
+        with st.spinner("Fetching Sentinel-2 imagery..."):
+            before_scene, after_scene = sat.fetch_pair(
+                aoi, before_date, after_date, window_days, max_cloud, config.THUMB_SIZE, mode
+            )
+        with st.spinner("Detecting change..."):
+            result = run_change_detection(
+                before_scene.rgb,
+                after_scene.rgb,
+                aoi.bounds(),
+                threshold=threshold,
+                min_pixels=int(min_pixels),
+                loaded=loaded,
+                method=method,
+            )
+        STATE.scenes = (before_scene, after_scene)
+        STATE.result = result
+    except (sat.SatelliteError, ModelNotAvailable, ValueError) as exc:
+        STATE.result = None
+        st.error(str(exc))
+
+if not STATE.result:
+    st.stop()
+
+before_scene, after_scene = STATE.scenes
+result = STATE.result
+stats = result["statistics"]
+
+# --------------------------------------------------------------------------
+# 4. Before / after
+# --------------------------------------------------------------------------
+st.subheader("4. Before and after")
+col1, col2 = st.columns(2)
+for column, scene, title in (
+    (col1, before_scene, "Before"),
+    (col2, after_scene, "After"),
+):
+    column.image(scene.rgb, use_container_width=True, caption=f"{title} — {scene.acquisition_date}")
+    column.markdown(
+        f"**Acquired:** {scene.acquisition_date}  \n"
+        f"**Cloud cover in AOI:** {scene.cloud_cover:.1f}%  \n"
+        f"**Source:** {scene.label}  \n"
+        f"**Scene:** `{scene.scene_id}`  \n"
+        f"**Grid:** {scene.meta['pixel_grid']} px at ~{scene.resolution_m:g} m/px"
+    )
+if before_scene.composite:
+    st.caption(
+        "Composites blend several acquisition dates: "
+        f"before {', '.join(before_scene.contributing_dates)} | "
+        f"after {', '.join(after_scene.contributing_dates)}"
+    )
+
+st.markdown("**Slider comparison**")
+alpha = st.slider("Move towards the after image", 0.0, 1.0, 0.5, 0.02)
+blended = (
+    before_scene.rgb.astype(np.float32) * (1 - alpha) + after_scene.rgb.astype(np.float32) * alpha
+).astype(np.uint8)
+st.image(blended, use_container_width=True, caption=f"{(1 - alpha) * 100:.0f}% before / {alpha * 100:.0f}% after")
+
+# --------------------------------------------------------------------------
+# 5. Change overlay
+# --------------------------------------------------------------------------
+st.subheader("5. Where the change is")
+col1, col2 = st.columns(2)
+col1.image(result["mask_image"], use_container_width=True, caption="Change mask (white = changed)")
+col2.image(result["overlay"], use_container_width=True, caption="Change overlay on the after image")
+st.image(result["difference"], use_container_width=True, caption="Absolute difference (visual aid only)")
+
+if not result["regions"]:
+    st.info(
+        "No changed region survived the threshold and the minimum-region filter. That is a real "
+        "result, not an error: lower the threshold or enlarge the date gap to look for subtler "
+        "change."
+    )
+
+st.markdown(
+    human_summary(
+        STATE.place,
+        before_scene.acquisition_date,
+        after_scene.acquisition_date,
+        result["regions"],
+        stats,
+    )
+)
+
+# --------------------------------------------------------------------------
+# 6. Metrics
+# --------------------------------------------------------------------------
+st.subheader("6. Results")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Total area", f"{stats['aoi_area_km2']:.3f} km²")
+col2.metric("Changed area", f"{stats['changed_area_km2']:.3f} km²")
+col3.metric("Unchanged area", f"{stats['unchanged_area_km2']:.3f} km²")
+col4.metric("Change", f"{stats['change_percentage']:.2f}%")
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Changed pixels", f"{stats['changed_pixels']:,}")
+col2.metric("Unchanged pixels", f"{stats['unchanged_pixels']:,}")
+col3.metric("Regions", stats["regions"])
+col4.metric("Ground sampling", f"{stats['metres_per_pixel_x']:g} m/px")
+
+if result["regions"]:
+    st.dataframe(
+        pd.DataFrame([region.as_dict() for region in result["regions"]])[
+            ["change_id", "change_type", "area_hectares", "confidence", "centroid_lat", "centroid_lon"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+with st.expander("Model quality on labelled data"):
+    metrics = test_metrics()
+    checkpoint_metrics = (result["model"].get("val_metrics") or {}) if method == METHOD_MODEL else {}
+    if method == METHOD_DIFFERENCE:
+        st.warning(
+            "The pixel-difference baseline is not a trained model, so accuracy, precision, "
+            "recall, F1, IoU and Dice cannot be attributed to it here."
+        )
+    elif metrics:
+        st.caption(
+            f"Held-out {metrics['split']} split of {metrics['dataset']} — {metrics['pairs']} image "
+            f"pairs, decision threshold {metrics['threshold']:.2f}, evaluated {metrics['evaluated_at']}."
+        )
+        cols = st.columns(4)
+        for column, key in zip(cols, ("accuracy", "precision", "recall", "f1")):
+            column.metric(key.capitalize(), f"{metrics[key] * 100:.2f}%")
+        cols = st.columns(4)
+        for column, key in zip(cols, ("iou", "dice", "balanced_accuracy", "specificity")):
+            column.metric(key.replace("_", " ").capitalize(), f"{metrics[key] * 100:.2f}%")
+        st.caption(
+            f"Confusion matrix (pixels): TP {metrics['tp']:,} · FP {metrics['fp']:,} · "
+            f"FN {metrics['fn']:,} · TN {metrics['tn']:,}. Only "
+            f"{metrics['positive_rate'] * 100:.2f}% of pixels are truly changed, so plain pixel "
+            "accuracy looks high for any model — read F1 and IoU instead."
+        )
+        if config.CONFUSION_MATRIX_PNG.is_file():
+            st.image(str(config.CONFUSION_MATRIX_PNG), width=430)
+        if config.QUALITATIVE_PNG.is_file():
+            st.image(str(config.QUALITATIVE_PNG), caption="Test-set predictions vs ground truth")
+    elif checkpoint_metrics:
+        st.warning(
+            "No test-set evaluation has been run yet. The numbers below are validation metrics "
+            "stored in the checkpoint. Run `python -m src.evaluate --data data/LEVIR-CD` for "
+            "held-out test metrics."
+        )
+        st.json({k: round(v, 4) for k, v in checkpoint_metrics.items() if isinstance(v, (int, float))})
+    else:
+        st.error(
+            "No labelled evaluation data has been processed, so accuracy, precision, recall, F1, "
+            "IoU and Dice cannot be reliably calculated for this checkpoint. Run:\n\n"
+            "```\npython download_data.py\npython -m src.evaluate --data data/LEVIR-CD\n```"
+        )
+    st.caption(
+        "These figures describe the model on LEVIR-CD (0.5 m aerial imagery). They do not "
+        "transfer directly to the 10 m Sentinel-2 pairs analysed above — no labelled ground "
+        "truth exists for this AOI, so the change percentage on this page cannot be scored."
+    )
+
+st.caption(RESOLUTION_NOTE)
+
+# --------------------------------------------------------------------------
+# 7. Downloads
+# --------------------------------------------------------------------------
+st.subheader("7. Downloads")
+stamp = f"{STATE.place.split(',')[0].strip().replace(' ', '_') or 'aoi'}_{before_scene.acquisition_date}_{after_scene.acquisition_date}"
+files = {
+    "Before image": (png_bytes(before_scene.rgb), f"{stamp}_before.png"),
+    "After image": (png_bytes(after_scene.rgb), f"{stamp}_after.png"),
+    "Change mask": (png_bytes(result["mask_image"]), f"{stamp}_mask.png"),
+    "Change overlay": (png_bytes(result["overlay"]), f"{stamp}_overlay.png"),
+}
+columns = st.columns(len(files))
+for column, (label, (data, name)) in zip(columns, files.items()):
+    column.download_button(label, data, file_name=name, mime="image/png", use_container_width=True)
+
+col1, col2 = st.columns(2)
+payload = {
+    "location": STATE.place,
+    "latitude": STATE.lat,
+    "longitude": STATE.lon,
+    "radius_km": radius_km,
+    "before": {
+        "requested": before_date.isoformat(),
+        "acquired": before_scene.acquisition_date,
+        "cloud_percent": before_scene.cloud_cover,
+        "scene": before_scene.scene_id,
+    },
+    "after": {
+        "requested": after_date.isoformat(),
+        "acquired": after_scene.acquisition_date,
+        "cloud_percent": after_scene.cloud_cover,
+        "scene": after_scene.scene_id,
+    },
+    "detector": result["model"].get("architecture"),
+    "threshold": result["threshold"],
+    "statistics": stats,
+    "regions": [region.as_dict() for region in result["regions"]],
+}
+col1.download_button(
+    "Analysis JSON",
+    json.dumps(payload, indent=2, default=str),
+    file_name=f"{stamp}_analysis.json",
+    mime="application/json",
+    use_container_width=True,
+)
+
+if col2.button("Build PDF report", use_container_width=True):
+    pdf = build_pdf(
+        {
+            "location": STATE.place,
+            "coordinates": f"{STATE.lat:.5f}, {STATE.lon:.5f}",
+            "aoi": f"{radius_km:g} km radius",
+            "before_requested": before_date.isoformat(),
+            "before_acquired": before_scene.acquisition_date,
+            "before_cloud": before_scene.cloud_cover,
+            "after_requested": after_date.isoformat(),
+            "after_acquired": after_scene.acquisition_date,
+            "after_cloud": after_scene.cloud_cover,
+            "model": result["model"],
+            "threshold": result["threshold"],
+            "statistics": stats,
+            "regions": result["regions"],
+            "summary": human_summary(
+                STATE.place,
+                before_scene.acquisition_date,
+                after_scene.acquisition_date,
+                result["regions"],
+                stats,
+            ),
+            "images": {
+                "before": before_scene.rgb,
+                "after": after_scene.rgb,
+                "mask": result["mask_image"],
+                "overlay": result["overlay"],
+            },
+        }
+    )
+    st.download_button(
+        "Download PDF",
+        pdf,
+        file_name=f"{stamp}_report.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )

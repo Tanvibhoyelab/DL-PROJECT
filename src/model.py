@@ -247,21 +247,26 @@ class SiameseUNet(nn.Module):
 
 
 class DiceBCELoss(nn.Module):
-    """Combined loss used to train change_detector.pth.
+    """Combined loss:
 
-    Matches Section III-C of the paper:
-        L = L_BCE + L_Dice
+        L = L_BCE(pos_weight) + L_Dice
         L_Dice = 1 - (2|P ∩ G| + eps) / (|P| + |G| + eps)
 
-    where P is the predicted change probability map (post-sigmoid)
-    and G is the ground-truth binary mask. BCE is computed on raw
-    logits (numerically stable), Dice on the sigmoid probabilities.
+    where P is the predicted change probability map (post-sigmoid) and G is the
+    ground-truth binary mask. BCE is computed on raw logits (numerically
+    stable), Dice on the sigmoid probabilities.
+
+    Change masks are heavily imbalanced (roughly 5% changed pixels in LEVIR-CD),
+    so unweighted BCE lets the network collapse towards predicting "no change".
+    ``pos_weight`` is passed in by the training script, measured from the
+    training labels rather than guessed.
     """
 
-    def __init__(self, eps: float = 1e-6):
+    def __init__(self, eps: float = 1e-6, pos_weight: float | None = None):
         super().__init__()
         self.eps = eps
-        self.bce = nn.BCEWithLogitsLoss()
+        weight = None if pos_weight is None else torch.tensor([float(pos_weight)])
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=weight)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         bce_loss = self.bce(logits, target)
